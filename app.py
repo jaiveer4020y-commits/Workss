@@ -48,6 +48,249 @@ class AllMovieLandM3U8:
 
             html_content = response.text
             
+            # Extract player domain
+            domain_match = re.search(r"const AwsIndStreamDomain\s*=\s*['\"]([^'\"]+)['\"]", html_content)
+            player_domain = domain_match.group(1) if domain_match else None
+            print(f"Player Domain: {player_domain}")
+
+            # Extract video ID from scripts
+            video_sources = []
+            
+            # Look for various script patterns
+            script_patterns = [
+                r'src\s*:\s*[\'"]([^\'"]+)[\'"]',
+                r'video-id[\'"]?\s*:\s*[\'"]([^\'"]+)[\'"]',
+                r'file\s*:\s*[\'"]([^\'"]+)[\'"]',
+            ]
+            
+            for pattern in script_patterns:
+                matches = re.findall(pattern, html_content, re.IGNORECASE)
+                if matches:
+                    video_sources.extend(matches)
+                    print(f"Found video sources: {matches}")
+
+            # Look for iframe embeds
+            iframe_matches = re.findall(r'<iframe[^>]*src=[\'"]([^\'"]+)[\'"]', html_content)
+            for iframe_src in iframe_matches:
+                if 'player' in iframe_src or 'embed' in iframe_src:
+                    video_sources.append(iframe_src)
+                    print(f"Found iframe source: {iframe_src}")
+
+            print(f"Total video sources found: {len(video_sources)}")
+            
+            if player_domain and video_sources:
+                return {
+                    'player_domain': player_domain,
+                    'video_sources': video_sources
+                }
+            else:
+                print("No video sources found")
+                return None
+
+        except Exception as e:
+            print(f"Error extracting video data: {e}")
+            return None
+
+    def get_embed_data(self, player_domain, video_source, referer_url):
+        """Get data from embed/player page"""
+        try:
+            # Construct embed URL
+            if video_source.startswith('http'):
+                embed_url = video_source
+            else:
+                embed_url = f"https://{player_domain}/play/{video_source}"
+            
+            print(f"Accessing embed URL: {embed_url}")
+            
+            response = self.session.get(embed_url, headers={'Referer': referer_url}, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"Failed to fetch embed: Status {response.status_code}")
+                return None
+
+            # Look for JSON data in script
+            json_match = re.search(r'(\{.*?\})', response.text)
+            if json_match:
+                try:
+                    json_data = json.loads(json_match.group(1))
+                    print(f"Found JSON data: {list(json_data.keys())}")
+                    return json_data
+                except json.JSONDecodeError:
+                    print("Failed to parse JSON data")
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error getting embed data: {e}")
+            return None
+
+    def get_m3u8_content(self, player_domain, file_path, token):
+        """Get M3U8 content"""
+        try:
+            m3u8_url = f"https://{player_domain}/playlist/{file_path}.txt"
+            print(f"Fetching M3U8 from: {m3u8_url}")
+            
+            headers = {
+                'Referer': BASE_URL + '/'
+            }
+            
+            if token:
+                headers['X-CSRF-TOKEN'] = token
+            
+            response = self.session.post(m3u8_url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                print("Successfully fetched M3U8 content")
+                return response.text
+            else:
+                print(f"Failed to fetch M3U8: Status {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"Error getting M3U8 content: {e}")
+            return None
+
+# Initialize the M3U8 handler
+m3u8_handler = AllMovieLandM3U8()
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "AllMovieLand M3U8 Proxy Server",
+        "status": "active",
+        "endpoints": {
+            "test_avengers": "/m3u8?url=https://allmovieland.ac/3101-the-avengers.html",
+            "debug": "/debug?url=content_url",
+            "health": "/health"
+        }
+    })
+
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": time.time(),
+        "base_url": BASE_URL
+    })
+
+@app.route('/debug')
+def debug_url():
+    """Debug endpoint to see what data we can extract"""
+    content_url = request.args.get('url')
+    if not content_url:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    print(f"Debugging URL: {content_url}")
+    m3u8_handler.get_cookies()
+    
+    video_data = m3u8_handler.extract_video_data(content_url)
+    if video_data:
+        return jsonify({
+            "success": True,
+            "debug_info": video_data
+        })
+    else:
+        return jsonify({
+            "error": "No video data found",
+            "suggestions": [
+                "Check if the URL is accessible",
+                "Verify the movie exists",
+                "Try a different content URL"
+            ]
+        })
+
+@app.route('/m3u8')
+def get_m3u8_links():
+    content_url = request.args.get('url')
+    if not content_url:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    print(f"Processing M3U8 request for: {content_url}")
+    
+    # Ensure we have cookies
+    m3u8_handler.get_cookies()
+    
+    # Extract video data
+    video_data = m3u8_handler.extract_video_data(content_url)
+    if not video_data:
+        return jsonify({
+            "error": "Failed to extract video data from the URL",
+            "debug_suggestion": "Use /debug endpoint to see what data is available"
+        }), 500
+    
+    player_domain = video_data['player_domain']
+    video_sources = video_data['video_sources']
+    
+    m3u8_results = []
+    
+    # Try each video source
+    for source in video_sources[:3]:
+        print(f"Trying source: {source}")
+        
+        embed_data = m3u8_handler.get_embed_data(player_domain, source, content_url)
+        if embed_data and embed_data.get('file'):
+            file_path = embed_data['file']
+            token = embed_data.get('key', '')
+            
+            m3u8_content = m3u8_handler.get_m3u8_content(player_domain, file_path, token)
+            if m3u8_content:
+                m3u8_results.append({
+                    'title': f"Source - {source[:20]}...",
+                    'file': file_path,
+                    'player_domain': player_domain,
+                    'token': token,
+                    'm3u8_content_preview': m3u8_content[:100] + "..." if len(m3u8_content) > 100 else m3u8_content
+                })
+    
+    if m3u8_results:
+        return jsonify({
+            "success": True,
+            "content_url": content_url,
+            "player_domain": player_domain,
+            "sources_found": len(video_sources),
+            "m3u8_streams": m3u8_results
+        })
+    else:
+        return jsonify({
+            "error": "No M3U8 streams found",
+            "debug_info": {
+                "player_domain": player_domain,
+                "video_sources_found": video_sources
+            }
+        })
+
+@app.route('/direct')
+def direct_m3u8():
+    """Direct M3U8 access"""
+    file_path = request.args.get('file')
+    player_domain = request.args.get('domain')
+    token = request.args.get('token')
+    
+    if not all([file_path, player_domain]):
+        return jsonify({"error": "File and domain parameters are required"}), 400
+    
+    m3u8_content = m3u8_handler.get_m3u8_content(player_domain, file_path, token or '')
+    if m3u8_content:
+        return Response(m3u8_content, mimetype='application/vnd.apple.mpegurl')
+    else:
+        return jsonify({"error": "Failed to get M3U8 content"}), 500
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+    def extract_video_data(self, content_url):
+        """Extract video data from content page"""
+        try:
+            print(f"Extracting video data from: {content_url}")
+            
+            response = self.session.get(content_url, timeout=10)
+            
+            if response.status_code != 200:
+                print(f"Failed to fetch page: Status {response.status_code}")
+                return None
+
+            html_content = response.text
+            
             # Method 1: Extract player domain
             domain_match = re.search(r"const AwsIndStreamDomain\s*=\s*['\"]([^'\"]+)['\"]", html_content)
             player_domain = domain_match.group(1) if domain_match else None
